@@ -139,14 +139,10 @@ struct ecs_data_t {
 #define EcsTableHasAddActions       (EcsTableHasIsA | EcsTableHasSwitch | EcsTableHasCtors | EcsTableHasOnAdd | EcsTableHasOnSet | EcsTableHasMonitors)
 #define EcsTableHasRemoveActions    (EcsTableHasIsA | EcsTableHasDtors | EcsTableHasOnRemove | EcsTableHasUnSet | EcsTableHasMonitors)
 
-/** Edge used for traversing the table graph. */
-typedef struct ecs_edge_t {
-    ecs_table_t *add;            /* Edges traversed when adding */
-    ecs_table_t *remove;         /* Edges traversed when removing */
-
-    ecs_table_t *diff;           /* Difference in ids between tables */
-    ecs_table_t *on_set_sidi;    /* OnSet on set, UnSet on remove */
-    ecs_table_t *on_set_bidi;    /* OnSet both ways */
+typedef struct ecs_edge_diff_t {
+    ecs_ids_t diff;                 /* Difference in ids between tables */
+    // ecs_table_t *on_set_sidi;    /* OnSet on set, UnSet on remove */
+    // ecs_table_t *on_set_bidi;    /* OnSet both ways */
 
     /* Diff contains the difference in components between two tables. This is
      * usually the same as the component that was added, but can contain more
@@ -162,7 +158,29 @@ typedef struct ecs_edge_t {
      * with the component. When the component is set, OnSet is triggered for
      * the override. When the component is removed, OnSet is triggered because
      * the base component is re-exposed, with a potentially different value. */
+} ecs_edge_diff_t;
+
+/** Single edge. */
+typedef struct ecs_edge_t {
+    ecs_table_t *next;       /* Edge traversed when adding */
+    int32_t diff_index;      /* Index into diff vector (for non trivial edge) */
 } ecs_edge_t;
+
+/* Edges to other tables. */
+typedef struct ecs_graph_edges_t {
+    ecs_edge_t *lo; /* Small array optimized for low edges */
+    ecs_map_t *hi;  /* Map for hi edges */
+} ecs_graph_edges_t;
+
+/* Table graph node */
+typedef struct ecs_graph_node_t {
+    /* Add & remove edges to other tables */
+    ecs_graph_edges_t add;
+    ecs_graph_edges_t remove;
+
+    /* Metadata that keeps track of id diffs for non-trivial edges */ 
+    ecs_vector_t *diffs;
+} ecs_graph_node_t;
 
 /** Quey matched with table with backref to query table administration.
  * This type is used to store a matched query together with the array index of
@@ -188,8 +206,7 @@ struct ecs_table_t {
     ecs_data_t storage;              /* Component storage */
     ecs_type_info_t **c_info;        /* Cached pointers to component info */
 
-    ecs_edge_t *lo_edges;            /* Edges to other tables */
-    ecs_map_t *hi_edges;
+    ecs_graph_node_t node;           /* Graph node */
 
     ecs_vector_t *queries;           /* Queries matched with table */
     ecs_vector_t *monitors;          /* Monitor systems matched with table */
@@ -463,6 +480,12 @@ typedef struct ecs_table_record_t {
 struct ecs_id_record_t {
     /* All tables that contain the id */
     ecs_map_t *table_index;         /* map<table_id, ecs_table_record_t> */
+
+    /* All tables that created an outgoing (add) edge to the id */
+    ecs_map_t *add_refs;
+
+    /* All tables that created an incoming (remove) edge to the id */
+    ecs_map_t *remove_refs;
 
     ecs_entity_t on_delete;         /* Cleanup action for removing id */
     ecs_entity_t on_delete_object;  /* Cleanup action for removing object */

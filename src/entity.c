@@ -565,7 +565,7 @@ void components_override(
                  * be invoked */
 
                 table_without_base = flecs_table_traverse_remove(world, 
-                    table_without_base, component, NULL);
+                    table_without_base, &component, NULL);
             }
         }
 
@@ -587,7 +587,7 @@ void components_override(
             row, count)) 
         {
             table_without_base = flecs_table_traverse_remove(world, 
-                table_without_base, component, NULL);
+                table_without_base, &component, NULL);
         }
     }
 
@@ -942,7 +942,7 @@ void new(
     ecs_table_t *table = &world->store.root;
 
     for (i = 0; i < count; i ++) {
-        table = flecs_table_traverse_add(world, table, to_add->array[i], NULL);
+        table = flecs_table_traverse_add(world, table, &to_add->array[i], NULL);
     }
 
     new_entity(world, entity, &info, table, to_add, true);
@@ -1063,14 +1063,13 @@ void add_id_w_info(
     ecs_id_t id,
     bool construct)
 {
-    ecs_entity_t buffer[ECS_MAX_ADD_REMOVE];
-    ecs_ids_t added = { .array = buffer };
+    ecs_edge_diff_t diff;
 
     ecs_table_t *src_table = info->table;
     ecs_table_t *dst_table = flecs_table_traverse_add(
-        world, src_table, id, &added);
+        world, src_table, &id, &diff);
 
-    commit(world, entity, info, dst_table, &added, NULL, construct);
+    commit(world, entity, info, dst_table, &diff.diff, NULL, construct);
 }
 
 static
@@ -1089,14 +1088,12 @@ void add_id(
     ecs_entity_info_t info;
     flecs_get_info(world, entity, &info);
 
-    ecs_entity_t buffer[ECS_MAX_ADD_REMOVE];
-    ecs_ids_t added = { .array = buffer };
-
+    ecs_edge_diff_t diff;
     ecs_table_t *src_table = info.table;
     ecs_table_t *dst_table = flecs_table_traverse_add(
-        world, src_table, id, &added);
+        world, src_table, &id, &diff);
 
-    commit(world, entity, &info, dst_table, &added, NULL, true);
+    commit(world, entity, &info, dst_table, &diff.diff, NULL, true);
 
     flecs_defer_flush(world, stage);
 }
@@ -1117,14 +1114,12 @@ void remove_id(
     ecs_entity_info_t info;
     flecs_get_info(world, entity, &info);
 
-    ecs_entity_t buffer[ECS_MAX_ADD_REMOVE];
-    ecs_ids_t removed = { .array = buffer };
-
+    ecs_edge_diff_t diff;
     ecs_table_t *src_table = info.table;
     ecs_table_t *dst_table = flecs_table_traverse_remove(
-        world, src_table, id, &removed);
+        world, src_table, &id, &diff);
 
-    commit(world, entity, &info, dst_table, NULL, &removed, true);
+    commit(world, entity, &info, dst_table, NULL, &diff.diff, true);
 
     flecs_defer_flush(world, stage);
 }
@@ -1614,6 +1609,31 @@ ecs_entity_t ecs_new_w_id(
     return entity;
 }
 
+static
+int32_t ids_append(
+    ecs_ids_t *ids,
+    int32_t size,
+    ecs_ids_t *add)
+{
+    int32_t new_count = ids->count + add->count;
+    if (new_count >= size) {
+        size = flecs_next_pow_of_2(new_count);
+        ecs_id_t *arr = ecs_os_malloc(size * ECS_SIZEOF(ecs_id_t));
+        ecs_os_memcpy_n(arr, ids->array, ecs_id_t, ids->count);
+
+        if (ids->count >= ECS_MAX_ADD_REMOVE) {
+            ecs_os_free(ids->array);
+        }
+        
+        ids->array = arr;
+    }
+
+    ecs_os_memcpy_n(&ids->array[ids->count], add->array, ecs_id_t, add->count);
+    ids->count += add->count;
+
+    return size;
+}
+
 #ifdef FLECS_PARSER
 
 /* Traverse table graph by either adding or removing identifiers parsed from the
@@ -1635,6 +1655,7 @@ ecs_table_t *traverse_from_expr(
 
     const char *ptr = expr;
     if (ptr) {
+        ecs_edge_diff_t diff;
         ecs_term_t term = {0};
         while (ptr[0] && (ptr = ecs_parse_term(world, name, expr, ptr, &term))){
             if (!ecs_term_is_initialized(&term)) {
@@ -1651,28 +1672,17 @@ ecs_table_t *traverse_from_expr(
                 return NULL;
             }
 
-            if (modified->count == size) {
-                size *= 2;
-                ecs_id_t *arr = ecs_os_malloc(size * ECS_SIZEOF(ecs_id_t));
-                ecs_os_memcpy(arr, modified->array, 
-                    modified->count * ECS_SIZEOF(ecs_id_t));
-
-                if (modified->count != ECS_MAX_ADD_REMOVE) {
-                    ecs_os_free(modified->array);
-                }
-                
-                modified->array = arr;
-            }
-
             if (term.oper == EcsAnd || !replace_and) {
                 /* Regular AND expression */
                 if (is_add) {
                     table = flecs_table_traverse_add(
-                        world, table, term.id, modified);
+                        world, table, &term.id, &diff);
                 } else {
                     table = flecs_table_traverse_remove(
-                        world, table, term.id, modified);
+                        world, table, &term.id, &diff);
                 }
+
+                ids_append(modified, size, &diff.diff);
 
                 ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
             } else if (term.oper == EcsAndFrom) {
@@ -1689,11 +1699,13 @@ ecs_table_t *traverse_from_expr(
                 for (i = 0; i < count; i ++) {
                     if (is_add) {
                         table = flecs_table_traverse_add(
-                            world, table, ids[i], modified);
+                            world, table, &ids[i], &diff);
                     } else {
                         table = flecs_table_traverse_remove(
-                            world, table, ids[i], modified);
+                            world, table, &ids[i], &diff);
                     }
+
+                    ids_append(modified, size, &diff.diff);
                     
                     ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
                 }
@@ -1792,11 +1804,15 @@ void traverse_add_remove(
         }
     }
 
+    int32_t added_size = ECS_MAX_ADD_REMOVE;
     ecs_entity_t added_buffer[ECS_MAX_ADD_REMOVE];
     ecs_ids_t added = { .array = added_buffer };
 
+    int32_t removed_size = ECS_MAX_ADD_REMOVE;
     ecs_entity_t removed_buffer[ECS_MAX_ADD_REMOVE];
     ecs_ids_t removed = { .array = removed_buffer };
+    
+    ecs_edge_diff_t diff;
 
     /* Find destination table */
 
@@ -1805,21 +1821,24 @@ void traverse_add_remove(
     if (new_entity) {
         if (new_entity && scope && !name && !name_assigned) {
             ecs_entity_t id = ecs_pair(EcsChildOf, scope);
-            table = flecs_table_traverse_add(world, table, id, &added);
+            table = flecs_table_traverse_add(world, table, &id, &diff);
             ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
+            added_size = ids_append(&added, added_size, &diff.diff);
         }
 
         if (with) {
-            table = flecs_table_traverse_add(world, table, with, &added);
-            ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);            
+            table = flecs_table_traverse_add(world, table, &with, &diff);
+            ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);    
+            added_size = ids_append(&added, added_size, &diff.diff);
         }
     }
 
     /* If a name is provided but not yet assigned, add the Name component */
     if (name && !name_assigned) {
         ecs_entity_t id = ecs_pair(ecs_id(EcsIdentifier), EcsName);
-        table = flecs_table_traverse_add(world, table, id, &added);
-        ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);            
+        table = flecs_table_traverse_add(world, table, &id, &diff);
+        ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
+        added_size = ids_append(&added, added_size, &diff.diff);
     }
 
     /* Add components from the 'add' id array */
@@ -1827,16 +1846,18 @@ void traverse_add_remove(
     ecs_id_t id;
     const ecs_id_t *ids = desc->add;
     while ((i < ECS_MAX_ADD_REMOVE) && (id = ids[i ++])) {
-        table = flecs_table_traverse_add(world, table, id, &added);
+        table = flecs_table_traverse_add(world, table, &id, &diff);
         ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
+        added_size = ids_append(&added, added_size, &diff.diff);
     }
 
     /* Add components from the 'remove' id array */
     i = 0;
     ids = desc->remove;
     while ((i < ECS_MAX_ADD_REMOVE) && (id = ids[i ++])) {
-        table = flecs_table_traverse_remove(world, table, id, &removed);
+        table = flecs_table_traverse_remove(world, table, &id, &diff);
         ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
+        removed_size = ids_append(&removed, removed_size, &diff.diff);
     }
 
     /* Add components from the 'add_expr' expression */
@@ -2152,6 +2173,7 @@ ecs_entity_t ecs_type_init(
 
     ecs_table_t *table = NULL, *normalized = NULL;
 
+    ecs_edge_diff_t diff;
     ecs_entity_t added_buffer[ECS_MAX_ADD_REMOVE];
     ecs_ids_t added = { .array = added_buffer };
 
@@ -2162,9 +2184,10 @@ ecs_entity_t ecs_type_init(
     ecs_id_t id;
     const ecs_id_t *ids = desc->ids;
     while ((i < ECS_MAX_ADD_REMOVE) && (id = ids[i ++])) {
-        normalized = flecs_table_traverse_add(world, normalized, id, &added);
-        table = flecs_table_traverse_add(world, table, id, &added);
+        normalized = flecs_table_traverse_add(world, normalized, &id, &diff);
+        table = flecs_table_traverse_add(world, table, &id, &diff);
         ecs_assert(table != NULL, ECS_INVALID_PARAMETER, NULL);
+        ids_append(&added, ECS_MAX_ADD_REMOVE, &diff.diff);
     }
 
     /* If expression is set, add it to the table */
@@ -2236,7 +2259,7 @@ const ecs_entity_t* ecs_bulk_new_w_id(
     ecs_table_t *table = &world->store.root;
     
     if (id) {
-        table = flecs_table_traverse_add(world, table, id, NULL);
+        table = flecs_table_traverse_add(world, table, &id, NULL);
     }
 
     ids = new_w_data(world, table, NULL, count, NULL, NULL);
@@ -2295,12 +2318,10 @@ void remove_from_table(
     int32_t column,
     int32_t column_count)
 {
+    ecs_edge_diff_t diff;
     ecs_entity_t removed_buffer[ECS_MAX_ADD_REMOVE];
     ecs_ids_t removed = { .array = removed_buffer };
-
-    if (column_count > ECS_MAX_ADD_REMOVE) {
-        removed.array = ecs_os_malloc_n(ecs_id_t, column_count);
-    }
+    int32_t removed_size = ECS_MAX_ADD_REMOVE;
 
     ecs_table_t *dst_table = src_table; 
     ecs_id_t *ids = ecs_vector_first(src_table->type, ecs_id_t);
@@ -2327,8 +2348,8 @@ void remove_from_table(
             continue;
         }
 
-        dst_table = flecs_table_traverse_remove(
-            world, dst_table, e, &removed);
+        dst_table = flecs_table_traverse_remove(world, dst_table, &e, &diff);
+        removed_size = ids_append(&removed, removed_size, &diff.diff);
         
         removed_count ++;
         if (removed_count == column_count) {
@@ -2395,31 +2416,6 @@ void delete_objects(
 }
 
 static
-void delete_tables_for_id_record(
-    ecs_world_t *world,
-    ecs_id_t id,
-    ecs_id_record_t *idr)
-{
-    /* Delete tables in id record. Because deleting the table updates the
-     * map, remove the map pointer from the id record. This will prevent the
-     * table from removing itself from the map as it is deleted, which
-     * allows for iterating the map without changing it. */
-    
-    if (!world->is_fini) {
-        ecs_map_t *table_index = idr->table_index;
-        idr->table_index = NULL;
-        ecs_map_iter_t it = ecs_map_iter(table_index);
-        ecs_table_record_t *tr;
-        while ((tr = ecs_map_next(&it, ecs_table_record_t, NULL))) {
-            flecs_delete_table(world, tr->table);
-        }
-        ecs_map_free(table_index);
-
-        flecs_clear_id_record(world, id);
-    }
-}
-
-static
 void on_delete_object_action(
     ecs_world_t *world,
     ecs_id_t id)
@@ -2465,7 +2461,7 @@ void on_delete_object_action(
             }
         }
 
-        delete_tables_for_id_record(world, id, idr);
+        flecs_clear_id_record(world, id);
     }
 }
 
@@ -2498,7 +2494,7 @@ void on_delete_relation_action(
             }
         }
 
-        delete_tables_for_id_record(world, id, idr);
+        flecs_clear_id_record(world, id);
     }
 }
 
@@ -3288,7 +3284,10 @@ ecs_entity_t ecs_get_alive(
     ecs_entity_t entity)
 {
     ecs_assert(world != NULL, ECS_INVALID_PARAMETER, NULL);
-    ecs_assert(entity != 0, ECS_INVALID_PARAMETER, NULL);
+    
+    if (!entity) {
+        return 0;
+    }
 
     if (ecs_is_alive(world, entity)) {
         return entity;
@@ -3539,31 +3538,31 @@ size_t ecs_id_str(
         bytes_left = append_to_str(pptr, "|", bytes_left, &required);
     }
 
-    ecs_entity_t e = id & ECS_COMPONENT_MASK;
-
     if (ECS_HAS_ROLE(id, PAIR)) {
-        ecs_entity_t lo = ECS_PAIR_OBJECT(id);
-        ecs_entity_t hi = ECS_PAIR_RELATION(id);
+        ecs_entity_t rel = ECS_PAIR_RELATION(id);
+        ecs_entity_t obj = ECS_PAIR_OBJECT(id);
 
-        if (lo) lo = ecs_get_alive(world, lo);
-        if (hi) hi = ecs_get_alive(world, hi);
-
-        if (hi) {
-            char *hi_path = ecs_get_fullpath(world, hi);
-            bytes_left = append_to_str(pptr, "(", bytes_left, &required);
-            bytes_left = append_to_str(pptr, hi_path, bytes_left, &required);
-            ecs_os_free(hi_path);
-            bytes_left = append_to_str(pptr, ",", bytes_left, &required);
+        ecs_entity_t e;
+        if ((e = ecs_get_alive(world, rel))) {
+            rel = e;
+        }
+        if ((e = ecs_get_alive(world, obj))) {
+            obj = e;
         }
 
-        char *lo_path = ecs_get_fullpath(world, lo);
-        bytes_left = append_to_str(pptr, lo_path, bytes_left, &required);
-        ecs_os_free(lo_path);
+        char *rel_str = ecs_get_fullpath(world, rel);
+        bytes_left = append_to_str(pptr, "(", bytes_left, &required);
+        bytes_left = append_to_str(pptr, rel_str, bytes_left, &required);
+        ecs_os_free(rel_str);
+        bytes_left = append_to_str(pptr, ",", bytes_left, &required);
 
-        if (hi) {
-            append_to_str(pptr, ")", bytes_left, &required);
-        }
+        char *obj_str = ecs_get_fullpath(world, obj);
+        bytes_left = append_to_str(pptr, obj_str, bytes_left, &required);
+        ecs_os_free(obj_str);
+
+        append_to_str(pptr, ")", bytes_left, &required);
     } else {
+        ecs_entity_t e = id & ECS_COMPONENT_MASK;
         char *path = ecs_get_fullpath(world, e);
         append_to_str(pptr, path, bytes_left, &required);
         ecs_os_free(path);
@@ -3581,14 +3580,16 @@ void flush_bulk_new(
     ecs_world_t *world,
     ecs_op_t *op)
 {
-    ecs_entity_t *ids = op->is._n.entities;
+    ecs_entity_t *entities = op->is._n.entities;
 
-    int i, count = op->is._n.count;
-    for (i = 0; i < count; i ++) {
-        add_id(world, ids[i], op->id);
+    if (op->id) {
+        int i, count = op->is._n.count;
+        for (i = 0; i < count; i ++) {
+            add_id(world, entities[i], op->id);
+        }
     }
 
-    ecs_os_free(ids);
+    ecs_os_free(entities);
 }
 
 static
@@ -3625,7 +3626,9 @@ void discard_op(
             free_value(world, &op->is._1.entity, op->id, op->is._1.value, 1);
             ecs_os_free(value);
         }
-    }  
+    } else {
+        ecs_os_free(op->is._n.entities);
+    }
 }
 
 static 
